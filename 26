@@ -1,0 +1,871 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Estación Terrena - CanSat Competition 2027 (PocketQube) - BORRADOR
+===================================================================
+
+Basado en los requerimientos de "Cansat Competition Guide 2027" Rev 1.2b.
+
+Cobertura de requisitos (referencia rápida):
+  GS1        -> Un display con varias pestañas: Container / PocketQube
+  GS2 / GS3  -> Container: gráficas en tiempo real (altitud, temperatura,
+                corriente) + resto de telemetría en texto
+  GS4 / GS5  -> PocketQube: gráficas (altitud, temperatura, voltaje,
+                corriente, orientación XYZ, posición GNSS, paneles solares)
+                + resto de telemetría en texto
+  GS6        -> Envío de comandos al Container y al PocketQube
+  GS7/GS8/16 -> Modo simulación: carga de archivo de perfil de presión y
+                envío de SIMP a 1 Hz mediante un botón
+  GS9/GS10   -> Fuera del alcance del software (batería/antena físicas)
+  GS11       -> Contador de paquetes recibidos en la estación terrena
+  GS12       -> Fuente grande (14pt+), trazos en negrita, fondo claro
+  GS13       -> Generación de archivos CSV: Flight_<TEAM>C.csv / ...P.csv
+  GS14-18    -> Arquitectura propia del equipo / capa de radio intercambiable
+
+IMPORTANTE:
+Este archivo es un BORRADOR de arquitectura de software. La capa de radio
+(ESPNOW / XBEE de respaldo) se representa con una interfaz abstracta
+`RadioInterface`. Se incluye un backend de demostración (`DemoRadio`) que
+genera telemetría sintética, para poder probar la interfaz sin hardware.
+El equipo debe reemplazar `DemoRadio` por la implementación real (por
+ejemplo usando `pyserial` hacia un puente ESPNOW/XBEE conectado por USB).
+"""
+
+import csv
+import math
+import random
+import threading
+import time
+import queue
+from collections import deque
+from dataclasses import dataclass, fields
+from datetime import datetime, timezone
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+# ---------------------------------------------------------------------------
+# Apariencia global (Requisito GS12: fuente >=14pt, trazos en negrita,
+# fondo claro / texto oscuro para lectura bajo luz solar directa)
+# ---------------------------------------------------------------------------
+FONT_MAIN = ("Segoe UI", 14)
+FONT_BOLD = ("Segoe UI", 14, "bold")
+FONT_MONO = ("Consolas", 13)
+BG_LIGHT = "#f4f4f2"
+FG_DARK = "#111111"
+
+plt.rcParams.update({
+    "font.size": 12,
+    "axes.titlesize": 13,
+    "axes.titleweight": "bold",
+    "axes.labelsize": 12,
+    "lines.linewidth": 2.2,
+    "axes.facecolor": "#ffffff",
+    "figure.facecolor": BG_LIGHT,
+    "axes.edgecolor": "#333333",
+    "grid.color": "#cccccc",
+})
+
+MAX_POINTS = 300  # puntos visibles en cada gráfica (ventana deslizante)
+
+
+# ---------------------------------------------------------------------------
+# Estructuras de telemetría (según formatos CSV definidos en el manual)
+# ---------------------------------------------------------------------------
+
+CONTAINER_FIELDS = [
+    "ID", "MISSION_TIME", "PACKET_COUNT", "COMMAND_COUNT", "MODE",
+    "ALTITUDE", "PRESSURE", "TEMPERATURE", "BATT_V", "BATT_I",
+    "MECH_STATE", "STATE", "CMD_ECHO",
+]
+
+POCKETQUBE_FIELDS = [
+    "ID", "MODE", "MISSION_TIME", "PACKET_COUNT", "COMMAND_COUNT",
+    "ALTITUDE", "TEMPERATURE", "PRESSURE", "VOLTAGE", "CURRENT",
+    "GNSS_TIME", "GNSS_ALTITUDE", "GNSS_LATITUDE", "GNSS_LONGITUDE",
+    "GNSS_SATS", "ROT_RATE_X", "ROT_RATE_Y", "ROT_RATE_Z",
+    "ACCEL_X", "ACCEL_Y", "ACCEL_Z", "MAG_X", "MAG_Y", "MAG_Z",
+    "SOLAR_1", "SOLAR_2", "MECH_STATE", "CMD_ECHO",
+    "IMAGE_STABILIZATION", "SCIENCE_EXP",
+]
+
+
+def parse_csv_line(line: str, expected_fields):
+    """Convierte una línea CSV recibida por radio en un diccionario.
+    Ignora líneas que no tengan al menos el número mínimo de campos."""
+    parts = [p.strip() for p in line.strip().split(",")]
+    if len(parts) < len(expected_fields):
+        # Rellenar campos faltantes (p.ej. IMAGE_STABILIZATION/SCIENCE_EXP
+        # que tienen largo variable) para no romper el parseo
+        parts += [""] * (len(expected_fields) - len(parts))
+    return dict(zip(expected_fields, parts[:len(expected_fields)]))
+
+
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+# ---------------------------------------------------------------------------
+# Capa de radio (interfaz abstracta + backend de demostración)
+# ---------------------------------------------------------------------------
+
+class RadioInterface:
+    """Interfaz que debe implementar el enlace real (ESPNOW / XBEE).
+    Reemplazar `DemoRadio` por una clase que hable con el hardware real,
+    manteniendo esta misma interfaz para no modificar el resto de la UI."""
+
+    def connect(self, channel: str, peer_mac: str):
+        raise NotImplementedError
+
+    def disconnect(self):
+        raise NotImplementedError
+
+    def send_command(self, target: str, command: str):
+        """target: 'CONTAINER' o 'POCKETQUBE'"""
+        raise NotImplementedError
+
+    def set_rx_callback(self, callback):
+        """callback(source:str, raw_line:str) se llama por cada paquete."""
+        raise NotImplementedError
+
+
+class DemoRadio(RadioInterface):
+    """Backend de demostración: genera telemetría sintética a 4 Hz para
+    poder probar la interfaz sin hardware. NO usar en vuelo real."""
+
+    def __init__(self):
+        self._running = False
+        self._thread = None
+        self._callback = None
+        self._t0 = None
+        self._pkt_c = 0
+        self._pkt_p = 0
+        self._cmd_count = 0
+        self._sim_mode = False
+
+    def connect(self, channel: str, peer_mac: str):
+        self._running = True
+        self._t0 = time.time()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def disconnect(self):
+        self._running = False
+
+    def set_rx_callback(self, callback):
+        self._callback = callback
+
+    def send_command(self, target: str, command: str):
+        self._cmd_count += 1
+        if command.startswith("SIM"):
+            if "ACTIVATE" in command:
+                self._sim_mode = True
+            if command.strip() == "SIM FLIGHT" or "DISABLE" in command:
+                self._sim_mode = False
+
+    def _loop(self):
+        while self._running:
+            t = time.time() - self._t0
+            self._pkt_c += 1
+            self._pkt_p += 1
+            alt = max(0.0, 300 * math.sin(t / 20) + 300)
+            container_row = [
+                "1000C", f"{t:.3f}", str(self._pkt_c), str(self._cmd_count),
+                "S" if self._sim_mode else "F", f"{alt:.1f}",
+                f"{101325 - alt*11:.0f}", f"{22 + random.uniform(-0.3,0.3):.1f}",
+                f"{7.4 + random.uniform(-0.05,0.05):.2f}",
+                f"{120 + random.uniform(-5,5):.0f}", "0", "ASCENT", "CXON",
+            ]
+            pq_row = [
+                "1000P", "S" if self._sim_mode else "F", f"{t:.3f}",
+                str(self._pkt_p), str(self._cmd_count),
+                f"{alt*0.98:.1f}", f"{21 + random.uniform(-0.3,0.3):.1f}",
+                f"{101325 - alt*11:.0f}", f"{4.1 + random.uniform(-0.05,0.05):.2f}",
+                f"{80 + random.uniform(-5,5):.0f}",
+                datetime.now(timezone.utc).strftime("%H%M%S"),
+                f"{alt*0.98:.1f}", f"{19.4326 + random.uniform(-0.0005,0.0005):.6f}",
+                f"{-99.1332 + random.uniform(-0.0005,0.0005):.6f}", "8",
+                f"{random.uniform(-5,5):.1f}", f"{random.uniform(-5,5):.1f}",
+                f"{random.uniform(-5,5):.1f}", f"{random.uniform(-1,1):.3f}",
+                f"{random.uniform(-1,1):.3f}", f"{9.8+random.uniform(-0.2,0.2):.3f}",
+                f"{random.uniform(200,600):.0f}", f"{random.uniform(200,600):.0f}",
+                f"{random.uniform(200,600):.0f}",
+                f"{3.3+random.uniform(-0.2,0.2):.2f}",
+                f"{3.3+random.uniform(-0.2,0.2):.2f}",
+                "F", "SPROT090", "OK", "",
+            ]
+            if self._callback:
+                self._callback("CONTAINER", ",".join(container_row))
+                self._callback("POCKETQUBE", ",".join(pq_row))
+            time.sleep(0.25)  # 4 Hz
+
+
+# ---------------------------------------------------------------------------
+# Buffer de series para graficar (ventana deslizante)
+# ---------------------------------------------------------------------------
+
+class SeriesBuffer:
+    def __init__(self, maxlen=MAX_POINTS):
+        self.t = deque(maxlen=maxlen)
+        self.y = deque(maxlen=maxlen)
+
+    def add(self, t, y):
+        self.t.append(t)
+        self.y.append(y)
+
+
+# ---------------------------------------------------------------------------
+# Escritor de CSV (Requisito GS13 - Flight_<TEAM>C.csv / Flight_<TEAM>P.csv)
+# ---------------------------------------------------------------------------
+
+class TelemetryLogger:
+    def __init__(self, team_id_var, suffix, fieldnames):
+        self.team_id_var = team_id_var
+        self.suffix = suffix
+        self.fieldnames = fieldnames
+        self._file = None
+        self._writer = None
+        self.active = False
+        self.row_count = 0
+
+    def start(self):
+        team = self.team_id_var.get().strip() or "0000"
+        filename = f"Flight_{team}{self.suffix}.csv"
+        self._file = open(filename, "w", newline="", encoding="utf-8")
+        self._writer = csv.writer(self._file)
+        self._writer.writerow(self.fieldnames)
+        self.active = True
+        self.row_count = 0
+        return filename
+
+    def write(self, row_dict):
+        if self.active and self._writer:
+            self._writer.writerow([row_dict.get(f, "") for f in self.fieldnames])
+            self.row_count += 1
+
+    def stop(self):
+        self.active = False
+        if self._file:
+            self._file.flush()
+            self._file.close()
+        self._file = None
+        self._writer = None
+
+
+# ---------------------------------------------------------------------------
+# Pestaña: Container  (GS2 / GS3)
+# ---------------------------------------------------------------------------
+
+class ContainerTab(ttk.Frame):
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app = app
+        self.buf_alt = SeriesBuffer()
+        self.buf_temp = SeriesBuffer()
+        self.buf_curr = SeriesBuffer()
+        self.text_vars = {f: tk.StringVar(value="--") for f in CONTAINER_FIELDS}
+
+        self._build_ui()
+
+    def _build_ui(self):
+        left = ttk.Frame(self)
+        left.pack(side="left", fill="both", expand=True)
+        right = ttk.Frame(self, width=340)
+        right.pack(side="right", fill="y")
+        right.pack_propagate(False)
+
+        # --- Gráficas requeridas explícitamente por GS2 ---
+        self.fig, self.axes = plt.subplots(3, 1, figsize=(6.5, 7), sharex=True)
+        self.fig.subplots_adjust(hspace=0.5)
+        titles = ["Altitud (m)", "Temperatura (C)", "Corriente Batería (mA)"]
+        self.lines = []
+        for ax, title in zip(self.axes, titles):
+            ax.set_title(title)
+            ax.grid(True, alpha=0.4)
+            (line,) = ax.plot([], [], color="#1a4fa0")
+            self.lines.append(line)
+        self.axes[-1].set_xlabel("Tiempo de misión (s)")
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=left)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        # --- Panel de texto: resto de telemetría (GS3) ---
+        ttk.Label(right, text="Container - Telemetría", font=FONT_BOLD).pack(
+            anchor="w", padx=8, pady=(10, 6))
+        grid = ttk.Frame(right)
+        grid.pack(fill="x", padx=8)
+        labels = {
+            "ID": "ID", "MISSION_TIME": "T. misión (s)",
+            "PACKET_COUNT": "Paq. TX (#)", "COMMAND_COUNT": "Cmds recibidos",
+            "MODE": "Modo", "PRESSURE": "Presión (Pa)",
+            "MECH_STATE": "Estado mecanismos", "STATE": "Estado de vuelo",
+            "CMD_ECHO": "Último comando",
+        }
+        for i, (field, label) in enumerate(labels.items()):
+            ttk.Label(grid, text=label + ":", font=FONT_MAIN).grid(
+                row=i, column=0, sticky="w", pady=3)
+            ttk.Label(grid, textvariable=self.text_vars[field],
+                      font=FONT_MONO, foreground="#003366").grid(
+                row=i, column=1, sticky="w", padx=(6, 0))
+
+        ttk.Separator(right).pack(fill="x", pady=12, padx=8)
+
+        # Contador de paquetes recibidos en la estación terrena (GS11)
+        ttk.Label(right, text="Paquetes recibidos (GS):", font=FONT_MAIN).pack(
+            anchor="w", padx=8)
+        self.rx_count_var = tk.StringVar(value="0")
+        ttk.Label(right, textvariable=self.rx_count_var, font=FONT_BOLD,
+                  foreground="#006600").pack(anchor="w", padx=8)
+
+    def update_telemetry(self, row: dict, mission_start_disp):
+        t = safe_float(row.get("MISSION_TIME"))
+        self.buf_alt.add(t, safe_float(row.get("ALTITUDE")))
+        self.buf_temp.add(t, safe_float(row.get("TEMPERATURE")))
+        self.buf_curr.add(t, safe_float(row.get("BATT_I")))
+
+        for buf, line, ax in zip(
+            [self.buf_alt, self.buf_temp, self.buf_curr], self.lines, self.axes
+        ):
+            line.set_data(buf.t, buf.y)
+            ax.relim()
+            ax.autoscale_view()
+        self.canvas.draw_idle()
+
+        for f in CONTAINER_FIELDS:
+            if f in row:
+                self.text_vars[f].set(row[f])
+
+        self.rx_count_var.set(str(int(self.rx_count_var.get()) + 1))
+
+
+# ---------------------------------------------------------------------------
+# Pestaña: PocketQube (GS4 / GS5)
+# ---------------------------------------------------------------------------
+
+class PocketQubeTab(ttk.Frame):
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app = app
+        self.buf_alt = SeriesBuffer()
+        self.buf_temp = SeriesBuffer()
+        self.buf_volt = SeriesBuffer()
+        self.buf_curr = SeriesBuffer()
+        self.buf_rot_x = SeriesBuffer()
+        self.buf_rot_y = SeriesBuffer()
+        self.buf_rot_z = SeriesBuffer()
+        self.buf_solar1 = SeriesBuffer()
+        self.buf_solar2 = SeriesBuffer()
+        self.gps_lat = deque(maxlen=MAX_POINTS)
+        self.gps_lon = deque(maxlen=MAX_POINTS)
+
+        self.text_vars = {f: tk.StringVar(value="--") for f in POCKETQUBE_FIELDS}
+        self._build_ui()
+
+    def _build_ui(self):
+        left = ttk.Frame(self)
+        left.pack(side="left", fill="both", expand=True)
+        right = ttk.Frame(self, width=360)
+        right.pack(side="right", fill="y")
+        right.pack_propagate(False)
+
+        self.fig, axes = plt.subplots(3, 2, figsize=(8, 7.5))
+        self.fig.subplots_adjust(hspace=0.6, wspace=0.35)
+        self.ax_alt, self.ax_temp = axes[0]
+        self.ax_v, self.ax_i = axes[1]
+        self.ax_rot, self.ax_solar = axes[2]
+
+        self.ax_alt.set_title("Altitud (m)")
+        self.ax_temp.set_title("Temperatura (C)")
+        self.ax_v.set_title("Voltaje batería (V)")
+        self.ax_i.set_title("Corriente batería (mA)")
+        self.ax_rot.set_title("Orientación (deg/s, X/Y/Z)")
+        self.ax_solar.set_title("Paneles solares (V)")
+        for ax in [self.ax_alt, self.ax_temp, self.ax_v, self.ax_i,
+                   self.ax_rot, self.ax_solar]:
+            ax.grid(True, alpha=0.4)
+
+        (self.line_alt,) = self.ax_alt.plot([], [], color="#1a4fa0")
+        (self.line_temp,) = self.ax_temp.plot([], [], color="#a01a1a")
+        (self.line_v,) = self.ax_v.plot([], [], color="#1a8020")
+        (self.line_i,) = self.ax_i.plot([], [], color="#a06a1a")
+        (self.line_rx,) = self.ax_rot.plot([], [], label="X", color="#c0392b")
+        (self.line_ry,) = self.ax_rot.plot([], [], label="Y", color="#27ae60")
+        (self.line_rz,) = self.ax_rot.plot([], [], label="Z", color="#2980b9")
+        self.ax_rot.legend(fontsize=8, loc="upper right")
+        (self.line_s1,) = self.ax_solar.plot([], [], label="Panel 1", color="#e67e22")
+        (self.line_s2,) = self.ax_solar.plot([], [], label="Panel 2", color="#8e44ad")
+        self.ax_solar.legend(fontsize=8, loc="upper right")
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=left)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        # GNSS: mini gráfico de posición (parte de GS4 "posición GPS")
+        self.gps_fig, self.gps_ax = plt.subplots(figsize=(3.2, 2.4))
+        self.gps_ax.set_title("Posición GNSS")
+        (self.gps_line,) = self.gps_ax.plot([], [], "o-", markersize=2,
+                                             color="#16697a")
+        self.gps_canvas = FigureCanvasTkAgg(self.gps_fig, master=right)
+        self.gps_canvas.get_tk_widget().pack(padx=8, pady=(10, 4))
+
+        ttk.Label(right, text="PocketQube - Telemetría", font=FONT_BOLD).pack(
+            anchor="w", padx=8, pady=(6, 4))
+        grid = ttk.Frame(right)
+        grid.pack(fill="x", padx=8)
+        labels = {
+            "ID": "ID", "MODE": "Modo", "MISSION_TIME": "T. misión (s)",
+            "PACKET_COUNT": "Paq. TX (#)", "COMMAND_COUNT": "Cmds recibidos",
+            "CMD_ECHO": "Último comando", "PRESSURE": "Presión (Pa)",
+            "GNSS_TIME": "Hora GNSS", "GNSS_SATS": "Satélites GNSS",
+            "MECH_STATE": "Estado mecanismos",
+            "IMAGE_STABILIZATION": "Estabilización img.",
+            "SCIENCE_EXP": "Exp. científico",
+        }
+        for i, (field, label) in enumerate(labels.items()):
+            ttk.Label(grid, text=label + ":", font=FONT_MAIN).grid(
+                row=i, column=0, sticky="w", pady=2)
+            ttk.Label(grid, textvariable=self.text_vars[field],
+                      font=FONT_MONO, foreground="#003366", wraplength=180).grid(
+                row=i, column=1, sticky="w", padx=(6, 0))
+
+        ttk.Label(right, text="Paquetes recibidos (GS):", font=FONT_MAIN).pack(
+            anchor="w", padx=8, pady=(10, 0))
+        self.rx_count_var = tk.StringVar(value="0")
+        ttk.Label(right, textvariable=self.rx_count_var, font=FONT_BOLD,
+                  foreground="#006600").pack(anchor="w", padx=8)
+
+    def update_telemetry(self, row: dict):
+        t = safe_float(row.get("MISSION_TIME"))
+        self.buf_alt.add(t, safe_float(row.get("ALTITUDE")))
+        self.buf_temp.add(t, safe_float(row.get("TEMPERATURE")))
+        self.buf_volt.add(t, safe_float(row.get("VOLTAGE")))
+        self.buf_curr.add(t, safe_float(row.get("CURRENT")))
+        self.buf_rot_x.add(t, safe_float(row.get("ROT_RATE_X")))
+        self.buf_rot_y.add(t, safe_float(row.get("ROT_RATE_Y")))
+        self.buf_rot_z.add(t, safe_float(row.get("ROT_RATE_Z")))
+        self.buf_solar1.add(t, safe_float(row.get("SOLAR_1")))
+        self.buf_solar2.add(t, safe_float(row.get("SOLAR_2")))
+
+        self.line_alt.set_data(self.buf_alt.t, self.buf_alt.y)
+        self.line_temp.set_data(self.buf_temp.t, self.buf_temp.y)
+        self.line_v.set_data(self.buf_volt.t, self.buf_volt.y)
+        self.line_i.set_data(self.buf_curr.t, self.buf_curr.y)
+        self.line_rx.set_data(self.buf_rot_x.t, self.buf_rot_x.y)
+        self.line_ry.set_data(self.buf_rot_y.t, self.buf_rot_y.y)
+        self.line_rz.set_data(self.buf_rot_z.t, self.buf_rot_z.y)
+        self.line_s1.set_data(self.buf_solar1.t, self.buf_solar1.y)
+        self.line_s2.set_data(self.buf_solar2.t, self.buf_solar2.y)
+
+        for ax in [self.ax_alt, self.ax_temp, self.ax_v, self.ax_i,
+                   self.ax_rot, self.ax_solar]:
+            ax.relim()
+            ax.autoscale_view()
+        self.canvas.draw_idle()
+
+        lat = safe_float(row.get("GNSS_LATITUDE"), None)
+        lon = safe_float(row.get("GNSS_LONGITUDE"), None)
+        if lat and lon:
+            self.gps_lat.append(lat)
+            self.gps_lon.append(lon)
+            self.gps_line.set_data(self.gps_lon, self.gps_lat)
+            self.gps_ax.relim()
+            self.gps_ax.autoscale_view()
+            self.gps_canvas.draw_idle()
+
+        for f in POCKETQUBE_FIELDS:
+            if f in row:
+                self.text_vars[f].set(row[f])
+
+        self.rx_count_var.set(str(int(self.rx_count_var.get()) + 1))
+
+
+# ---------------------------------------------------------------------------
+# Pestaña: Comandos y Simulación (GS6, GS7, GS8, GS16)
+# ---------------------------------------------------------------------------
+
+class CommandsTab(ttk.Frame):
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app = app
+        self.sim_running = False
+        self.sim_thread = None
+        self.sim_profile = []  # lista de valores de presión (Pa)
+
+        self._build_ui()
+
+    def _build_ui(self):
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=14, pady=14)
+
+        # --- Comandos generales (GS6) ---
+        cmd_frame = ttk.LabelFrame(top, text="Comandos", padding=12)
+        cmd_frame.pack(side="left", fill="y", padx=(0, 14))
+
+        ttk.Label(cmd_frame, text="Destino:", font=FONT_MAIN).grid(
+            row=0, column=0, sticky="w", pady=4)
+        self.target_var = tk.StringVar(value="CONTAINER")
+        ttk.Combobox(cmd_frame, textvariable=self.target_var,
+                     values=["CONTAINER", "POCKETQUBE"], state="readonly",
+                     width=14, font=FONT_MAIN).grid(row=0, column=1, pady=4)
+
+        buttons = [
+            ("CAL - Calibrar sensores", "CAL"),
+            ("ARM - Activar detección de lanzamiento", "ARM"),
+        ]
+        for i, (label, cmd) in enumerate(buttons, start=1):
+            ttk.Button(cmd_frame, text=label,
+                       command=lambda c=cmd: self._send(c)).grid(
+                row=i, column=0, columnspan=2, sticky="we", pady=4)
+
+        ttk.Label(cmd_frame, text="MEC (mecanismo):", font=FONT_MAIN).grid(
+            row=3, column=0, sticky="w", pady=(10, 2))
+        self.mech_var = tk.StringVar(value="RELEASE_PQ")
+        ttk.Combobox(cmd_frame, textvariable=self.mech_var, state="readonly",
+                     values=["RELEASE_PQ", "SOLAR_PANELS", "BOOM",
+                             "CAMERA_ROTATE_90"], width=18,
+                     font=FONT_MAIN).grid(row=4, column=0, columnspan=2, pady=2)
+        ttk.Button(cmd_frame, text="Enviar MEC",
+                   command=lambda: self._send(f"MEC {self.mech_var.get()}")
+                   ).grid(row=5, column=0, columnspan=2, sticky="we", pady=6)
+
+        ttk.Separator(cmd_frame, orient="horizontal").grid(
+            row=6, column=0, columnspan=2, sticky="we", pady=8)
+
+        ttk.Label(cmd_frame, text="Comando libre:", font=FONT_MAIN).grid(
+            row=7, column=0, sticky="w")
+        self.free_cmd_var = tk.StringVar()
+        ttk.Entry(cmd_frame, textvariable=self.free_cmd_var,
+                  font=FONT_MAIN, width=20).grid(row=8, column=0, columnspan=2, pady=4)
+        ttk.Button(cmd_frame, text="Enviar",
+                   command=lambda: self._send(self.free_cmd_var.get())).grid(
+            row=9, column=0, columnspan=2, sticky="we")
+
+        # --- Modo simulación (GS7 / GS8 / GS16) ---
+        sim_frame = ttk.LabelFrame(top, text="Modo Simulación", padding=12)
+        sim_frame.pack(side="left", fill="both", expand=True)
+
+        ttk.Label(sim_frame,
+                  text="1) Habilitar y activar el modo simulación en ambos "
+                       "sistemas (SIM ENABLE / SIM ACTIVATE).",
+                  font=FONT_MAIN, wraplength=420, justify="left").pack(
+            anchor="w", pady=(0, 8))
+
+        row1 = ttk.Frame(sim_frame)
+        row1.pack(fill="x", pady=4)
+        ttk.Button(row1, text="Enviar SIM ENABLE (Container + PocketQube)",
+                   command=self._sim_enable).pack(side="left", padx=(0, 8))
+        ttk.Button(row1, text="Enviar SIM ACTIVATE (Container + PocketQube)",
+                   command=self._sim_activate).pack(side="left")
+
+        ttk.Label(sim_frame,
+                  text="2) Cargar archivo de perfil de presión (una columna "
+                       "de valores en Pascales, 1 valor por segundo de vuelo).",
+                  font=FONT_MAIN, wraplength=420, justify="left").pack(
+            anchor="w", pady=(14, 6))
+
+        row2 = ttk.Frame(sim_frame)
+        row2.pack(fill="x")
+        ttk.Button(row2, text="Cargar archivo de perfil...",
+                   command=self._load_profile).pack(side="left")
+        self.profile_status_var = tk.StringVar(value="Sin archivo cargado")
+        ttk.Label(row2, textvariable=self.profile_status_var,
+                  font=FONT_MAIN, foreground="#555555").pack(
+            side="left", padx=10)
+
+        ttk.Label(sim_frame,
+                  text="3) Iniciar el envío de comandos SIMP a 1 Hz (Req. GS8).",
+                  font=FONT_MAIN, wraplength=420, justify="left").pack(
+            anchor="w", pady=(14, 6))
+
+        row3 = ttk.Frame(sim_frame)
+        row3.pack(fill="x")
+        self.btn_sim_start = ttk.Button(
+            row3, text="▶ Iniciar simulación", command=self._start_sim)
+        self.btn_sim_start.pack(side="left")
+        self.btn_sim_stop = ttk.Button(
+            row3, text="■ Detener simulación", command=self._stop_sim,
+            state="disabled")
+        self.btn_sim_stop.pack(side="left", padx=8)
+
+        self.sim_progress_var = tk.StringVar(value="Muestra: -- / --   "
+                                                     "Presión enviada: -- Pa")
+        ttk.Label(sim_frame, textvariable=self.sim_progress_var,
+                  font=FONT_BOLD, foreground="#0b5394").pack(
+            anchor="w", pady=(10, 0))
+        self.sim_progress = ttk.Progressbar(sim_frame, mode="determinate")
+        self.sim_progress.pack(fill="x", pady=(6, 0))
+
+        # --- Log de comandos ---
+        log_frame = ttk.LabelFrame(self, text="Registro de comandos", padding=8)
+        log_frame.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        self.log_text = tk.Text(log_frame, height=10, font=FONT_MONO,
+                                 bg="#ffffff", fg=FG_DARK, wrap="word")
+        self.log_text.pack(fill="both", expand=True)
+
+    def _log(self, msg):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log_text.insert("end", f"[{ts}] {msg}\n")
+        self.log_text.see("end")
+
+    def _send(self, cmd):
+        cmd = cmd.strip()
+        if not cmd:
+            return
+        target = self.target_var.get()
+        self.app.radio.send_command(target, cmd)
+        self._log(f"TX -> {target}: {cmd}")
+
+    def _sim_enable(self):
+        for target in ("CONTAINER", "POCKETQUBE"):
+            self.app.radio.send_command(target, "SIM ENABLE")
+        self._log("TX -> CONTAINER/POCKETQUBE: SIM ENABLE")
+
+    def _sim_activate(self):
+        for target in ("CONTAINER", "POCKETQUBE"):
+            self.app.radio.send_command(target, "SIM ACTIVATE")
+        self._log("TX -> CONTAINER/POCKETQUBE: SIM ACTIVATE")
+
+    def _load_profile(self):
+        path = filedialog.askopenfilename(
+            title="Seleccionar archivo de perfil de presión",
+            filetypes=[("CSV / texto", "*.csv *.txt"), ("Todos", "*.*")])
+        if not path:
+            return
+        values = []
+        try:
+            with open(path, newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if not row:
+                        continue
+                    try:
+                        values.append(float(row[0]))
+                    except ValueError:
+                        continue  # posible encabezado
+        except Exception as e:
+            messagebox.showerror("Error al leer archivo", str(e))
+            return
+
+        if not values:
+            messagebox.showwarning("Archivo vacío",
+                                    "No se encontraron valores numéricos de presión.")
+            return
+
+        self.sim_profile = values
+        self.profile_status_var.set(f"{len(values)} muestras cargadas")
+        self.sim_progress.configure(maximum=len(values), value=0)
+        self._log(f"Perfil de presión cargado: {len(values)} muestras desde {path}")
+
+    # --- Envío de SIMP a 1 Hz, en un hilo aparte para no bloquear la UI ---
+    def _start_sim(self):
+        if not self.sim_profile:
+            messagebox.showwarning("Sin perfil",
+                                    "Primero carga un archivo de perfil de presión.")
+            return
+        if self.sim_running:
+            return
+        self.sim_running = True
+        self.btn_sim_start.configure(state="disabled")
+        self.btn_sim_stop.configure(state="normal")
+        self._log("Simulación iniciada: enviando SIMP a 1 Hz")
+        self.sim_thread = threading.Thread(target=self._sim_loop, daemon=True)
+        self.sim_thread.start()
+
+    def _stop_sim(self):
+        self.sim_running = False
+        self.btn_sim_start.configure(state="normal")
+        self.btn_sim_stop.configure(state="disabled")
+        self._log("Simulación detenida por el usuario")
+
+    def _sim_loop(self):
+        total = len(self.sim_profile)
+        for i, pressure in enumerate(self.sim_profile):
+            if not self.sim_running:
+                break
+            cmd = f"SIMP {pressure:.0f}"
+            for target in ("CONTAINER", "POCKETQUBE"):
+                self.app.radio.send_command(target, cmd)
+            # Actualizaciones de UI deben hacerse en el hilo principal
+            self.after(0, self._update_sim_progress, i + 1, total, pressure)
+            time.sleep(1.0)  # Requisito GS8: 1 muestra por segundo
+        self.sim_running = False
+        self.after(0, lambda: self.btn_sim_start.configure(state="normal"))
+        self.after(0, lambda: self.btn_sim_stop.configure(state="disabled"))
+        self.after(0, lambda: self._log("Simulación finalizada"))
+
+    def _update_sim_progress(self, i, total, pressure):
+        self.sim_progress_var.set(
+            f"Muestra: {i} / {total}   Presión enviada: {pressure:.0f} Pa")
+        self.sim_progress.configure(value=i)
+
+
+# ---------------------------------------------------------------------------
+# Pestaña: Configuración (X2, X3, GS9/GS10/GS13/GS15)
+# ---------------------------------------------------------------------------
+
+class ConfigTab(ttk.Frame):
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app = app
+        self._build_ui()
+
+    def _build_ui(self):
+        frame = ttk.LabelFrame(self, text="Enlace de radio y equipo", padding=16)
+        frame.pack(fill="x", padx=14, pady=14, anchor="n")
+
+        ttk.Label(frame, text="Número de equipo (Team ID):", font=FONT_MAIN).grid(
+            row=0, column=0, sticky="w", pady=6)
+        ttk.Entry(frame, textvariable=self.app.team_id_var, font=FONT_MAIN,
+                  width=12).grid(row=0, column=1, sticky="w")
+
+        ttk.Label(frame, text="Canal ESPNOW asignado:", font=FONT_MAIN).grid(
+            row=1, column=0, sticky="w", pady=6)
+        self.channel_var = tk.StringVar(value="1")
+        ttk.Entry(frame, textvariable=self.channel_var, font=FONT_MAIN,
+                  width=12).grid(row=1, column=1, sticky="w")
+
+        ttk.Label(frame, text="MAC estación terrena (peer):", font=FONT_MAIN).grid(
+            row=2, column=0, sticky="w", pady=6)
+        self.mac_var = tk.StringVar(value="AA:BB:CC:DD:EE:FF")
+        ttk.Entry(frame, textvariable=self.mac_var, font=FONT_MAIN,
+                  width=20).grid(row=2, column=1, sticky="w")
+
+        self.conn_status_var = tk.StringVar(value="Desconectado")
+        ttk.Label(frame, text="Estado del enlace:", font=FONT_MAIN).grid(
+            row=3, column=0, sticky="w", pady=(14, 4))
+        ttk.Label(frame, textvariable=self.conn_status_var, font=FONT_BOLD,
+                  foreground="#a01a1a").grid(row=3, column=1, sticky="w", pady=(14, 4))
+
+        btn_row = ttk.Frame(frame)
+        btn_row.grid(row=4, column=0, columnspan=2, pady=10, sticky="w")
+        ttk.Button(btn_row, text="Conectar", command=self._connect).pack(
+            side="left")
+        ttk.Button(btn_row, text="Desconectar", command=self._disconnect).pack(
+            side="left", padx=8)
+
+        log_frame = ttk.LabelFrame(self, text="Registro de datos (CSV)", padding=16)
+        log_frame.pack(fill="x", padx=14, pady=(0, 14), anchor="n")
+        ttk.Label(log_frame,
+                  text="Genera Flight_<TEAM>C.csv y Flight_<TEAM>P.csv en el "
+                       "formato requerido (Req. GS13) en la carpeta de trabajo.",
+                  font=FONT_MAIN, wraplength=560, justify="left").pack(anchor="w")
+        row = ttk.Frame(log_frame)
+        row.pack(fill="x", pady=8)
+        self.log_status_var = tk.StringVar(value="Registro detenido")
+        ttk.Button(row, text="▶ Iniciar registro CSV",
+                   command=self.app.start_logging).pack(side="left")
+        ttk.Button(row, text="■ Detener registro CSV",
+                   command=self.app.stop_logging).pack(side="left", padx=8)
+        ttk.Label(row, textvariable=self.log_status_var, font=FONT_MAIN,
+                  foreground="#555555").pack(side="left", padx=10)
+        self.app.log_status_var = self.log_status_var
+
+        note = ttk.Label(
+            self,
+            text=("Nota: la capa de radio activa en este borrador es un backend "
+                  "de DEMOSTRACIÓN que genera telemetría sintética. Sustituir "
+                  "DemoRadio por la implementación real de ESPNOW / respaldo XBEE "
+                  "antes de usar en pruebas de campo o vuelo."),
+            font=("Segoe UI", 11, "italic"), foreground="#886600",
+            wraplength=620, justify="left")
+        note.pack(padx=14, pady=10, anchor="w")
+
+    def _connect(self):
+        self.app.radio.connect(self.channel_var.get(), self.mac_var.get())
+        self.conn_status_var.set("Conectado (demo)")
+
+    def _disconnect(self):
+        self.app.radio.disconnect()
+        self.conn_status_var.set("Desconectado")
+
+
+# ---------------------------------------------------------------------------
+# Aplicación principal
+# ---------------------------------------------------------------------------
+
+class GroundStationApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Estación Terrena - CanSat 2027 (PocketQube) - Borrador")
+        self.geometry("1180x760")
+        self.configure(bg=BG_LIGHT)
+
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure(".", background=BG_LIGHT, foreground=FG_DARK,
+                         font=FONT_MAIN)
+        style.configure("TNotebook.Tab", font=FONT_BOLD, padding=(14, 8))
+        style.configure("TLabelframe.Label", font=FONT_BOLD)
+
+        self.team_id_var = tk.StringVar(value="1000")
+        self.log_status_var = None  # asignado por ConfigTab
+
+        self.radio = DemoRadio()
+        self.radio.set_rx_callback(self._on_radio_rx)
+
+        self.container_logger = TelemetryLogger(self.team_id_var, "C", CONTAINER_FIELDS)
+        self.pocketqube_logger = TelemetryLogger(self.team_id_var, "P", POCKETQUBE_FIELDS)
+
+        self._build_ui()
+
+    def _build_ui(self):
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill="both", expand=True, padx=6, pady=6)
+
+        self.container_tab = ContainerTab(notebook, self)
+        self.pocketqube_tab = PocketQubeTab(notebook, self)
+        self.commands_tab = CommandsTab(notebook, self)
+        self.config_tab = ConfigTab(notebook, self)
+
+        notebook.add(self.container_tab, text="  Container  ")
+        notebook.add(self.pocketqube_tab, text="  PocketQube  ")
+        notebook.add(self.commands_tab, text="  Comandos y Simulación  ")
+        notebook.add(self.config_tab, text="  Configuración  ")
+
+        status = ttk.Frame(self)
+        status.pack(fill="x", side="bottom")
+        ttk.Label(status, text="Equipo:", font=FONT_MAIN).pack(side="left", padx=(10, 2))
+        ttk.Label(status, textvariable=self.team_id_var, font=FONT_BOLD).pack(side="left")
+
+    # --- Recepción de telemetría (llamado desde el hilo de radio) ---
+    def _on_radio_rx(self, source, raw_line):
+        # Se llama desde un hilo de fondo: despachar al hilo principal de Tk
+        self.after(0, self._handle_rx, source, raw_line)
+
+    def _handle_rx(self, source, raw_line):
+        if source == "CONTAINER":
+            row = parse_csv_line(raw_line, CONTAINER_FIELDS)
+            self.container_tab.update_telemetry(row, None)
+            self.container_logger.write(row)
+        elif source == "POCKETQUBE":
+            row = parse_csv_line(raw_line, POCKETQUBE_FIELDS)
+            self.pocketqube_tab.update_telemetry(row)
+            self.pocketqube_logger.write(row)
+
+    # --- Registro CSV (GS13) ---
+    def start_logging(self):
+        fname_c = self.container_logger.start()
+        fname_p = self.pocketqube_logger.start()
+        if self.log_status_var:
+            self.log_status_var.set(f"Registrando en {fname_c} / {fname_p}")
+
+    def stop_logging(self):
+        self.container_logger.stop()
+        self.pocketqube_logger.stop()
+        if self.log_status_var:
+            self.log_status_var.set("Registro detenido")
+
+
+if __name__ == "__main__":
+    app = GroundStationApp()
+    app.mainloop()
